@@ -1,0 +1,618 @@
+#include "WaterLevelMeasure.h"
+#include <iostream>                        // std::cout  
+#include <sstream>                         
+#include<string>
+#include <opencv2\opencv.hpp>     // cv::Canny()  
+#include<vector>
+using namespace std;
+using namespace cv;
+
+/*************************************************************
+函数名：preDealWithImage
+***********************************************************/
+ErrorType CWaterLevelMeasure::preDealWithImage(DraftType type)
+{
+	_grayMat.create(_inputMat.rows, _inputMat.cols, CV_8UC1);
+
+	Mat  imgHsi;
+	imgHsi.create(_inputMat.rows, _inputMat.cols, CV_8UC3);
+	cvtColor(_inputMat, imgHsi, CV_BGR2HSV);
+	vector <Mat> vecHsi;
+	split(imgHsi, vecHsi);//分离H S I 
+	if (type == RedDraft)
+	{
+		for (int y = 0; y < vecHsi[0].rows; y++)
+		{
+			for (int x = 0; x < vecHsi[0].cols; x++)
+			{
+				if (vecHsi[1].at<uchar>(y, x)>43 && vecHsi[2].at<uchar>(y, x)>46 && (vecHsi[0].at<uchar>(y, x) < 6 || vecHsi[0].at<uchar>(y, x) >156))
+				{
+					_grayMat.at<uchar>(y, x) = 255;
+				}
+				else
+				{
+					_grayMat.at<uchar>(y, x) = 0;
+				}
+
+			}
+		}
+
+	}
+	else
+	{
+
+	}
+
+	return Normal;
+}
+/*************************************************************
+函数名：getWaterLevelScaler
+***********************************************************/
+ErrorType CWaterLevelMeasure::getWaterLevelScaler(int &sraftNumber)
+{
+	draftLocation();
+	_grayDraftMat = _grayCorrectMat(_targetRect);
+	sraftNumber =  getScaler(_grayDraftMat, _targetRect);
+
+	return Normal;
+}
+/*************************************************************
+函数名：CWaterLevelMeasure
+***********************************************************/
+CWaterLevelMeasure::CWaterLevelMeasure( std::string  imagePath, DraftType type)
+{
+	_lastError = Normal;
+	_inputMat = imread(imagePath);
+	if (!_inputMat.data || !(_inputMat.channels() == 3 || _inputMat.channels() == 4))
+	{
+		_lastError = InputFileError;
+	}
+	preDealWithImage(type);
+
+}
+/*************************************************************
+函数名：CWaterLevelMeasure
+***********************************************************/
+CWaterLevelMeasure::CWaterLevelMeasure( cv::Mat & inputMat, DraftType type)
+{
+	_lastError = Normal;
+	if (!inputMat.data || !(inputMat.channels() == 3 || inputMat.channels() == 4))
+	{
+		_lastError = InputFileError;
+	}
+	inputMat.copyTo(_inputMat);
+	preDealWithImage(type);
+}
+
+CWaterLevelMeasure::~CWaterLevelMeasure()
+{
+
+}
+/*************************************************************
+函数名：findUpDownBounding
+***********************************************************/
+int CWaterLevelMeasure::findUpDownBounding( cv::Mat& inImg, cv::Rect& outRect)
+{
+	int width = inImg.cols;
+	int hight = inImg.rows;
+	unsigned int lineJumpPoint = 0;
+	outRect.x = 0;
+	outRect.width = width;
+	//从左向右扫描，获取白色（目标）点数大于LINE_COUNT的点，即作为起点（噪声大的图像存在问题）
+	for (unsigned int i = 0; i <hight; ++i)
+	{
+		lineJumpPoint = 0;
+		for (unsigned int j = 0; j< width; ++j)
+		{
+			if (inImg.at<uchar>(i, j) >200)
+			{
+				lineJumpPoint++;
+
+			}
+		}
+
+		if (lineJumpPoint>LINE_COUNT)
+		{
+			if (i<5)
+			{
+				outRect.y = 0;
+			}
+			else
+			{
+				outRect.y = i - 5;//留一定余量
+			}
+
+			break;
+		}
+
+	}
+	//从右向左扫描，获取白色（目标）点数大于LINE_COUNT的点，即作为终点（噪声大的图像存在问题）
+	for (unsigned int i = hight - 1; i >= 0; --i)
+	{
+		lineJumpPoint = 0;
+		for (unsigned int j = 0; j< width; ++j)
+		{
+			if (inImg.at<uchar>(i, j) >200)
+			{
+				lineJumpPoint++;
+
+			}
+		}
+
+		if (lineJumpPoint>LINE_COUNT)
+		{
+			outRect.height = i - outRect.y + 5;//留一定余量
+			break;
+		}
+
+	}
+	return 0;
+}
+
+/*************************************************************
+函数名：draftLocation
+***********************************************************/
+ErrorType CWaterLevelMeasure::draftLocation()
+{
+	if (_lastError != Normal)
+	{
+		return _lastError;
+	}
+	//找水尺的上下边界
+	int ret = findUpDownBounding(_grayMat, _targetRect);
+	if (ret == 0)
+	{
+		//采用下半部分作为参考，屏蔽噪声  可优化
+		Rect rect(_targetRect.x, _targetRect.y + _targetRect.height / 2, _targetRect.width, _targetRect.height / 2);
+		Mat  rectoreGray = _grayMat(rect);
+#ifdef _DEBUG
+		cv::imshow("旋转矩形：", rectoreGray);
+#endif
+		cv::Rect tempRect;
+		double angle = findRotateAngle(rectoreGray, tempRect);//若tempRect变化  里面代码需要相应更改
+		_targetRect.x = tempRect.x;
+		_targetRect.width = tempRect.width;
+		//矫正图像
+		imageRotate(_grayMat, _grayCorrectMat, angle);
+
+		//修正上下边缘
+		Mat element = getStructuringElement(MORPH_RECT, Size(5, 5));
+		//进行形态学操作  ,获取最小外接矩形集合，再次进行修正
+		Mat  dilateMst;
+		dilate(_grayCorrectMat, dilateMst, element);
+		vector<vector<cv::Point>> contours;
+		cv::findContours(dilateMst, contours, CV_RETR_EXTERNAL, CV_CHAIN_APPROX_NONE);
+
+		int cnt = contours.size();
+		vector<RotatedRect> box(contours.size()); //定义最小外接矩形集合
+
+		int maxAreaIndex = 0;
+		double maxArea = 0;
+
+		//水尺是外接矩形面积最大者
+		for (size_t i = 0; i < contours.size(); i++)
+		{
+			box[i] = minAreaRect(Mat(contours[i]));  //计算每个轮廓最小外接矩形
+			double tempArea = box[i].size.area();
+			if (tempArea>maxArea)
+			{
+				maxArea = tempArea;
+				maxAreaIndex = i;
+			}
+		}
+
+		tempRect = boundingRect(Mat(contours[maxAreaIndex]));
+		_targetRect.y = tempRect.y;
+		_targetRect.height = tempRect.height;
+		//修正左右边缘
+		Mat edge, binEdge;
+		Sobel(_grayCorrectMat, edge, _grayMat.depth(), 0, 1);
+		//对灰度图进行滤波  
+		medianBlur(edge, binEdge, 3);
+		binEdge = thinImage(binEdge);
+		//通过扫描线再次修正水尺位置
+		scannerLine(binEdge, _targetRect);
+
+	}
+}
+/*************************************************************
+函数名：findRotateAngle
+***********************************************************/
+double CWaterLevelMeasure::findRotateAngle( cv::Mat& inImg, cv::Rect& outRect)
+{
+
+	int width = inImg.cols;
+	int hight = inImg.rows;
+
+	Mat element = getStructuringElement(MORPH_RECT, Size(5, 5));
+	//进行形态学操作  
+	Mat  dilateMst;
+
+	dilate(inImg, dilateMst, element);
+
+#ifdef _DEBUG
+	imshow("膨胀", dilateMst);
+#endif
+
+	vector<vector<cv::Point>> contours;
+	cv::findContours(dilateMst, contours, CV_RETR_EXTERNAL, CV_CHAIN_APPROX_NONE);
+
+	int cnt = contours.size();
+	vector<RotatedRect> box(contours.size()); //定义最小外接矩形集合
+
+	int maxAreaIndex = 0;
+	double maxArea = 0;
+	//水尺对应最小外接矩形
+	for (size_t i = 0; i < contours.size(); i++)
+	{
+		box[i] = minAreaRect(Mat(contours[i]));  //计算每个轮廓最小外接矩形
+		double tempArea = box[i].size.area();
+		if (tempArea>maxArea)
+		{
+			maxArea = tempArea;
+			maxAreaIndex = i;
+		}
+	}
+	double angle = box[maxAreaIndex].angle;
+
+	//矫正图片
+	imageRotate(dilateMst, dilateMst, angle);
+	maxAreaIndex = 0;
+	maxArea = 0;
+	//获取矫正后的水尺的最小外接矩形下标
+	for (size_t i = 0; i < contours.size(); i++)
+	{
+		box[i] = minAreaRect(Mat(contours[i]));  //计算每个轮廓最小外接矩形
+		double tempArea = box[i].size.area();
+		if (tempArea>maxArea)
+		{
+			maxArea = tempArea;
+			maxAreaIndex = i;
+		}
+	}
+
+	outRect = boundingRect(Mat(contours[maxAreaIndex]));
+	//角度确定  ： 左旋和右旋的不同
+	if (angle <-45)
+	{
+		return 90 + angle;
+	}
+	else
+	{
+		return angle;
+	}
+
+}
+/*************************************************************
+函数名：imageRotate
+***********************************************************/
+void CWaterLevelMeasure::imageRotate( cv::Mat& img, cv::Mat& newIm, double angle)
+{
+	int len = max(img.cols, img.rows);
+	Point2f pt(len / 2., len / 2.);
+	Mat r = getRotationMatrix2D(pt, angle, 1.0);
+	warpAffine(img, newIm, r, Size(len, len));
+}
+/**
+* @brief 对输入图像进行细化
+* @param src为输入图像,用cvThreshold函数处理过的8位灰度图像格式，元素中只有0与1,1代表有元素，0代表为空白
+* @param maxIterations限制迭代次数，如果不进行限制，默认为-1，代表不限制迭代次数，直到获得最终结果
+* @return 为对src细化后的输出图像,格式与src格式相同，元素中只有0与1,1代表有元素，0代表为空白
+*/
+cv::Mat CWaterLevelMeasure::thinImage( cv::Mat & src, const int maxIterations )
+{
+	assert(src.type() == CV_8UC1);
+	cv::Mat dst;
+	int width = src.cols;
+	int height = src.rows;
+	src.copyTo(dst);
+	int count = 0;  //记录迭代次数  
+	while (true)
+	{
+		count++;
+		if (maxIterations != -1 && count > maxIterations) //限制次数并且迭代次数到达  
+			break;
+		std::vector<uchar *> mFlag; //用于标记需要删除的点  
+									//对点标记  
+		for (int i = 0; i < height; ++i)
+		{
+			uchar * p = dst.ptr<uchar>(i);
+			for (int j = 0; j < width; ++j)
+			{
+				//如果满足四个条件，进行标记  
+				//  p9 p2 p3  
+				//  p8 p1 p4  
+				//  p7 p6 p5  
+				uchar p1 = p[j];
+				if (p1 != 1) continue;
+				uchar p4 = (j == width - 1) ? 0 : *(p + j + 1);
+				uchar p8 = (j == 0) ? 0 : *(p + j - 1);
+				uchar p2 = (i == 0) ? 0 : *(p - dst.step + j);
+				uchar p3 = (i == 0 || j == width - 1) ? 0 : *(p - dst.step + j + 1);
+				uchar p9 = (i == 0 || j == 0) ? 0 : *(p - dst.step + j - 1);
+				uchar p6 = (i == height - 1) ? 0 : *(p + dst.step + j);
+				uchar p5 = (i == height - 1 || j == width - 1) ? 0 : *(p + dst.step + j + 1);
+				uchar p7 = (i == height - 1 || j == 0) ? 0 : *(p + dst.step + j - 1);
+				if ((p2 + p3 + p4 + p5 + p6 + p7 + p8 + p9) >= 2 && (p2 + p3 + p4 + p5 + p6 + p7 + p8 + p9) <= 6)
+				{
+					int ap = 0;
+					if (p2 == 0 && p3 == 1) ++ap;
+					if (p3 == 0 && p4 == 1) ++ap;
+					if (p4 == 0 && p5 == 1) ++ap;
+					if (p5 == 0 && p6 == 1) ++ap;
+					if (p6 == 0 && p7 == 1) ++ap;
+					if (p7 == 0 && p8 == 1) ++ap;
+					if (p8 == 0 && p9 == 1) ++ap;
+					if (p9 == 0 && p2 == 1) ++ap;
+
+					if (ap == 1 && p2 * p4 * p6 == 0 && p4 * p6 * p8 == 0)
+					{
+						//标记  
+						mFlag.push_back(p + j);
+					}
+				}
+			}
+		}
+
+		//将标记的点删除  
+		for (std::vector<uchar *>::iterator i = mFlag.begin(); i != mFlag.end(); ++i)
+		{
+			**i = 0;
+		}
+
+		//直到没有点满足，算法结束  
+		if (mFlag.empty())
+		{
+			break;
+		}
+		else
+		{
+			mFlag.clear();//将mFlag清空  
+		}
+
+		//对点标记  
+		for (int i = 0; i < height; ++i)
+		{
+			uchar * p = dst.ptr<uchar>(i);
+			for (int j = 0; j < width; ++j)
+			{
+				//如果满足四个条件，进行标记  
+				//  p9 p2 p3  
+				//  p8 p1 p4  
+				//  p7 p6 p5  
+				uchar p1 = p[j];
+				if (p1 != 1) continue;
+				uchar p4 = (j == width - 1) ? 0 : *(p + j + 1);
+				uchar p8 = (j == 0) ? 0 : *(p + j - 1);
+				uchar p2 = (i == 0) ? 0 : *(p - dst.step + j);
+				uchar p3 = (i == 0 || j == width - 1) ? 0 : *(p - dst.step + j + 1);
+				uchar p9 = (i == 0 || j == 0) ? 0 : *(p - dst.step + j - 1);
+				uchar p6 = (i == height - 1) ? 0 : *(p + dst.step + j);
+				uchar p5 = (i == height - 1 || j == width - 1) ? 0 : *(p + dst.step + j + 1);
+				uchar p7 = (i == height - 1 || j == 0) ? 0 : *(p + dst.step + j - 1);
+
+				if ((p2 + p3 + p4 + p5 + p6 + p7 + p8 + p9) >= 2 && (p2 + p3 + p4 + p5 + p6 + p7 + p8 + p9) <= 6)
+				{
+					int ap = 0;
+					if (p2 == 0 && p3 == 1) ++ap;
+					if (p3 == 0 && p4 == 1) ++ap;
+					if (p4 == 0 && p5 == 1) ++ap;
+					if (p5 == 0 && p6 == 1) ++ap;
+					if (p6 == 0 && p7 == 1) ++ap;
+					if (p7 == 0 && p8 == 1) ++ap;
+					if (p8 == 0 && p9 == 1) ++ap;
+					if (p9 == 0 && p2 == 1) ++ap;
+
+					if (ap == 1 && p2 * p4 * p8 == 0 && p2 * p6 * p8 == 0)
+					{
+						//标记  
+						mFlag.push_back(p + j);
+					}
+				}
+			}
+		}
+
+		//将标记的点删除  
+		for (std::vector<uchar *>::iterator i = mFlag.begin(); i != mFlag.end(); ++i)
+		{
+			**i = 0;
+		}
+
+		//直到没有点满足，算法结束  
+		if (mFlag.empty())
+		{
+			break;
+		}
+		else
+		{
+			mFlag.clear();//将mFlag清空  
+		}
+	}
+	return dst;
+}
+
+/*************************************************************
+函数名：scannerLine
+***********************************************************/
+int  CWaterLevelMeasure::scannerLine(Mat& inImg, cv::Rect& ioRect)
+{
+	int width = inImg.cols;
+	int hight = inImg.rows;
+	unsigned int *lineJumpPoint = new unsigned int[width];
+
+	for (unsigned int i = 0; i <width; ++i)
+	{
+		lineJumpPoint[i] = 0;
+	}
+
+	//横向扫描一幅图，统计一幅图的跳变个数
+	for (unsigned int i = 0; i <width; ++i)
+	{
+		for (unsigned int j = 0; j< hight - 1; ++j)
+		{
+			if ((unsigned int)abs((inImg.at<uchar>(j, i) - inImg.at<uchar>(j + 1, i))) >200)
+			{
+				lineJumpPoint[i]++;
+			}
+		}
+
+	}
+
+	//寻找左边缘
+	int  leftIndex = 0;
+	for (int i = 0; i<width - 3; ++i)
+	{
+		if (lineJumpPoint[i] >= JUMP_COUNT && lineJumpPoint[i + 1] >= JUMP_COUNT && lineJumpPoint[i + 2] >= JUMP_COUNT)
+		{
+			leftIndex = i;
+			break;
+		}
+
+	}
+	if (leftIndex == 0 || leftIndex == width - 2)
+	{
+		return -2;//没有找到左边缘
+	}
+
+	int rightIndex = width - 3;
+	for (int i = width - 3; i >= (leftIndex + 2); --i)
+	{
+		if (lineJumpPoint[i] >= JUMP_COUNT && lineJumpPoint[i - 1] >= JUMP_COUNT && lineJumpPoint[i - 2] >= JUMP_COUNT)
+		{
+			rightIndex = i + 2;//预留两个点
+			break;
+		}
+
+	}
+	if ((rightIndex <= (leftIndex + LEFT_RIGHT_COUNT)))
+	{
+		return -3;//没有找到右边缘
+	}
+	ioRect.x = leftIndex;
+	ioRect.width = rightIndex - leftIndex;
+	//Rect rect(leftIndex, 0, rightIndex- leftIndex, hight);
+
+	delete[]lineJumpPoint;
+	return 0;
+}
+/*************************************************************
+函数名：getScaler
+***********************************************************/
+int CWaterLevelMeasure::getScaler(cv::Mat & inMat, cv::Rect inRect)
+{
+	int sizeStructuringElement = inRect.width / 4;
+	if (sizeStructuringElement % 2 == 0)
+	{
+		sizeStructuringElement--;
+	}
+	//将水尺分割为左右部分,目的：消除文字
+	cv::Rect leftRect;
+	leftRect.x = 0;
+	leftRect.y = 0;
+	leftRect.width = inRect.width / 2;
+	leftRect.height = inRect.height;
+
+	cv::Rect rightRect;
+	rightRect.x = inRect.width / 2;
+	rightRect.y = 0;
+	rightRect.width = inRect.width / 2;
+	rightRect.height = inRect.height;
+	Mat  allMat;
+
+	allMat.create(inRect.height, inRect.width, CV_8UC1);
+
+
+	Mat imageRoiRight = inMat(rightRect);
+	Mat imageRoiLeft = inMat(leftRect);
+	//定义核  
+	Mat element = getStructuringElement(MORPH_RECT, Size(sizeStructuringElement, sizeStructuringElement));
+	//进行形态学操作  
+	Mat erodeRightMat;
+	//进行腐蚀操作  
+	dilate(imageRoiRight, erodeRightMat, element);
+	// 先腐蚀再膨胀
+	erode(erodeRightMat, erodeRightMat, element);
+	//用右半部分消除左边部门的文字
+	for (int i = 0; i<leftRect.width; ++i)
+	{
+		for (int j = 0; j < leftRect.height; ++j)
+		{
+			inMat.at<uchar>(j, i) = imageRoiLeft.at<uchar>(j, i) &(255 - erodeRightMat.at<uchar>(j, i));
+		}
+	}
+
+	//消除竖线，使得全部变为横线的刻度
+	//定义核  
+	Mat element1 = getStructuringElement(MORPH_RECT, Size(sizeStructuringElement, 1));
+	//进行形态学操作  
+	Mat erodeMat;
+	// 先腐蚀再膨胀
+	erode(inMat, erodeMat, element1, Point(-1, -1));
+	//对灰度图进行滤波  
+	GaussianBlur(erodeMat, erodeMat, Size(sizeStructuringElement, sizeStructuringElement), 0, 0);
+	dilate(erodeMat, erodeMat, element1, Point(-1, -1));
+	Sobel(erodeMat, erodeMat, erodeMat.depth(), 0, 1);
+#ifdef _DEBUG
+	cv::imshow("erodeMat", erodeMat);
+#endif 
+
+	//读取刻度
+	vector<vector<cv::Point>> contours;
+	cv::findContours(erodeMat, contours, CV_RETR_EXTERNAL, CV_CHAIN_APPROX_NONE);
+
+	int cnt = contours.size();
+	if (cnt == 0)
+	{
+		return -1;
+	}
+	vector<Rect> boundRect(contours.size());  //定义外接矩形集合
+
+	int countourHeightAverage = 0;
+	//获取平均高度
+	for (size_t i = 0; i < contours.size(); i++)
+	{
+
+		boundRect[i] = boundingRect(Mat(contours[i]));
+		countourHeightAverage += boundRect[i].height;
+	}
+	countourHeightAverage = countourHeightAverage / cnt;
+
+	//修正刻度
+	for (size_t i = 0; i < contours.size(); i++)
+	{
+		//修正横向连接的刻度线 （实际为两个）
+		if (boundRect[i].width >= 0.9* inRect.width)
+		{
+			cnt++;
+		}
+		//修正竖线连接的刻度线 （实际为两个）
+		if (boundRect[i].height >2 * countourHeightAverage)
+		{
+			cnt++;
+		}
+		//删除小噪声误识别为刻度线，通过面积
+		if (boundRect[i].width*boundRect[i].height < 0.25*inRect.width*countourHeightAverage)
+		{
+			cnt--;
+		}
+	}
+
+#ifdef _DEBUG
+	//画联通区域
+	cv::Mat result1;
+	erodeMat.copyTo(result1);
+
+
+	for (size_t i = 0; i < contours.size(); i++)
+	{
+		cv::Rect r = cv::boundingRect(contours[i]);
+
+		if (boundRect[i].width*boundRect[i].height >= 0.25*inRect.width*countourHeightAverage)
+		{
+			cv::rectangle(result1, r, cv::Scalar(255));
+		}
+	}
+	cv::imshow("all regions", result1);
+#endif 
+	return cnt;
+}
