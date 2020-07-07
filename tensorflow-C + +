@@ -1,0 +1,120 @@
+#include <iostream>
+#include <vector>
+#include <string>
+
+#include <fstream>
+
+#include "tensorflow/core/public/session.h"
+#include "tensorflow/core/platform/env.h"
+
+#include <opencv2/opencv.hpp>
+#include <sys/time.h>
+
+using namespace tensorflow;
+const std::string model_path = "./out4.pb";
+const int IMG_SIZE = 513;
+
+static const std::vector<cv::Scalar> colors {
+    cv::Scalar(0, 0, 0), // 背景
+    cv::Scalar(0,127,0), // 水面
+    cv::Scalar(0,0,127), // 水尺
+};
+
+std::vector<std::string > argv = {
+    "/home/xiao/river/cppcall/build/video/VID_20180202_105650.mkv",
+};
+
+int main() 
+{
+    for (int i = 0; i < argv.size(); ++i)
+        std::cout << argv[i] << std::endl;
+
+    Session* session;
+    std::cout << "NewSession" << std::endl;
+    Status status = NewSession(SessionOptions(), &session);
+    if (!status.ok()) {
+        std::cout << status.ToString() << std::endl;
+        return -1;
+    }
+    std::cout << "ReadBinaryProto" << std::endl;
+    GraphDef graphdef;
+    status = ReadBinaryProto(Env::Default(), model_path, &graphdef);
+
+    if (!status.ok()) {
+        std::cout << status.ToString() << std::endl;
+        return -1;
+    }
+    std::cout << "create" << std::endl;
+    status = session->Create(graphdef);
+    if (!status.ok()) {
+        std::cout << status.ToString() << std::endl;
+        return -1;
+    }
+
+    std::cout << "start" << std::endl;
+    struct timeval start, end;
+    for (int i = 0; i < argv.size(); ++i) {
+        std::cout << argv[i] << std::endl;
+        cv::VideoCapture cap(argv[i]);
+        if (!cap.isOpened())
+            continue;
+        std::cout << "open file succ: " << argv[i] << std::endl;
+        int fps = cap.get(cv::CAP_PROP_FPS);
+        std::string save_name = std::string(argv[i]) + std::string(".dat");
+
+        std::ofstream out;
+        out.open(save_name.c_str(), std::ios_base::out | std::ios_base::binary | std::ios_base::trunc);
+
+        if (!out.is_open()) {
+            std::cout << "can't open out file" << std::endl;
+            continue;
+        }
+
+        cv::Mat input;
+        Tensor input_tensor(DT_UINT8, TensorShape({1, IMG_SIZE, IMG_SIZE, 3}));
+        while (true) {
+            cap >> input;
+            if (input.empty())
+                break;
+            //std::cout << "#" << std::flush;    
+            uint8_t* img_ptr = input_tensor.flat<uint8_t>().data();
+            cv::Mat convertImg(IMG_SIZE, IMG_SIZE, CV_8UC3, img_ptr);
+            cv::resize(input, convertImg, cv::Size(IMG_SIZE, IMG_SIZE));
+
+            std::vector<std::pair<std::string, Tensor> > inputs = { {"ImageTensor:0", input_tensor} };
+            std::vector<Tensor> outputs;
+
+            gettimeofday(&start, NULL);
+            Status status = session->Run(inputs, {"SemanticPredictions:0"}, {}, &outputs);
+            if (!status.ok() || outputs.empty()) {
+                std::cout << status.ToString() << std::endl;
+                continue;
+            }
+            gettimeofday(&end, NULL);
+            std::cout << (end.tv_sec - start.tv_sec)*1000 + (end.tv_usec - start.tv_usec)/1000 << std::endl;
+            StringPiece output_matrix = outputs[0].tensor_data();
+
+            cv::Mat save_img = cv::Mat::zeros(IMG_SIZE, IMG_SIZE, CV_8UC1);
+            uint64_t* ptr = (uint64_t*)(output_matrix.data());
+
+            for (int row = 0; row < IMG_SIZE; ++row) {
+                uint64_t* ptr_line = ptr + IMG_SIZE * row;
+                for (int col = 0; col < IMG_SIZE; ++col) {
+                    int num = ptr_line[col];
+                    //save_img.at<uchar>(row, col) = num;
+                    const cv::Scalar& thiscolor = colors[num];
+                    save_img.at<cv::Vec3b>(row, col)[0] = thiscolor[0];
+                    save_img.at<cv::Vec3b>(row, col)[1] = thiscolor[1];
+                    save_img.at<cv::Vec3b>(row, col)[2] = thiscolor[2];
+                }
+            }
+            out.write((const char*)save_img.data, IMG_SIZE * IMG_SIZE);
+        }
+        std::cout << "write succ" << std::endl;
+        cap.release();
+    }
+
+    session->Close();
+    return 0;
+}
+
